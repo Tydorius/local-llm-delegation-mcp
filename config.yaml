@@ -1,0 +1,13 @@
+# Local LLM Configuration (Optimized for Qwen3-Coder-Flash on M5 Max)
+# Override these values to match what is appropriate on your machine
+model:
+  name: "openai/Qwen3-Coder-30B-A3B-Instruct-MLX-8bit" # Local OMLX model
+  temperature: 0.1
+  max_tokens: 32768
+  # Extra parameters passed to LiteLLM/Provider
+  extra_params:
+    num_ctx: 65536 # Doubled context for better repo understanding
+    num_predict: 32768 # Matches max_tokens
+    top_p: 0.80 # Tightened for better code correctness
+    top_k: 20 # Standard for Qwen3 Coder
+    repeat_penalty: 1.05

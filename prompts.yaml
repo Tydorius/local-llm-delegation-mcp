@@ -1,0 +1,18 @@
+# Prompt Templates
+# Use {context} and {prompt} as placeholders
+
+general:
+  system_message: "You are a helpful assistant. Provide concise, accurate responses."
+  user_template: "{prompt}"
+
+code_review:
+  system_message: "You are a code reviewer. Provide constructive feedback on code quality, potential issues, and improvements."
+  user_template: "Context:\n{context}\n\nTask:\n{prompt}"
+
+documentation:
+  system_message: "You are a technical writer. Create clear, concise documentation for the provided code."
+  user_template: "Context:\n{context}\n\nTask:\n{prompt}"
+
+refactor:
+  system_message: "You are a code refactoring expert. Suggest improvements while maintaining functionality."
+  user_template: "Context:\n{context}\n\nTask:\n{prompt}"

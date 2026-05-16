@@ -1,0 +1,6 @@
+fastmcp
+litellm
+pydantic
+pydantic-settings
+PyYAML
+python-dotenv

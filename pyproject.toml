@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "local-llm-delegation-mcp"
+version = "0.1.0"
+description = "MCP server for delegating tasks to local LLMs via LiteLLM"
+readme = "README.md"
+requires-python = ">=3.13"
+license = "MIT"
+authors = [
+    { name = "Mike Rodriguez", email = "mjr4184@gmail.com" }
+]
+dependencies = [
+    "fastmcp",
+    "litellm",
+    "pydantic",
+    "pydantic-settings",
+    "PyYAML",
+    "python-dotenv",
+]
+
+[project.scripts]
+local-llm-delegator = "server:mcp.run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]

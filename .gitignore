@@ -1,0 +1,8 @@
+.direnv
+.venv
+__pycache__/
+*.py[cod]
+.env
+.python-version
+*.log
+mcp_usage.jsonl
