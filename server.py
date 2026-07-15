@@ -10,8 +10,9 @@ import time
 import json
 import signal
 import threading
+import asyncio
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastmcp import FastMCP
 import litellm
@@ -184,6 +185,183 @@ def query_local_llm_with_context(
         duration = time.time() - start_time
         log_mcp_usage("query_local_llm_with_context", task_type, duration, status="error", error=str(e))
         return f"Error querying local LLM with context: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Quorum code review: fan out to N parallel independent reviewers, reconcile.
+# Each reviewer (a dedicated llama-swap instance) reasons independently.
+# ---------------------------------------------------------------------------
+
+# Default reviewer pool — override via env QUORUM_REVIEWERS (comma-separated).
+def _get_quorum_reviewers() -> List[str]:
+    env_val = os.environ.get("QUORUM_REVIEWERS", "").strip()
+    if env_val:
+        return [r.strip() for r in env_val.split(",") if r.strip()]
+    return ["delegation-reviewer-1", "delegation-reviewer-2", "delegation-reviewer-3"]
+
+
+QUORUM_SYSTEM_PROMPT = (
+    "You are an independent senior code reviewer. Review the code for correctness, "
+    "security, maintainability, and edge cases. Be specific and cite line numbers or "
+    "function names. Conclude with a single line in exactly this format:\n"
+    "VERDICT: APPROVE\n"
+    "or\n"
+    "VERDICT: REJECT\n"
+    "followed by a one-sentence reason. A REVIEWER is one of several voting; only "
+    "flag genuine issues, not style preferences."
+)
+
+
+async def _single_review(
+    reviewer_model: str, code: str, context: str, semaphore: asyncio.Semaphore
+) -> Tuple[str, str, bool, Optional[Exception]]:
+    """Run one independent review. Returns (model_name, verdict_text, succeeded, error)."""
+    async with semaphore:
+        try:
+            target = resolve_model(reviewer_model)
+            user_content = f"Context:\n{context}\n\nCode to review:\n```{code}```" if context else f"Code to review:\n```{code}```"
+            messages = [
+                {"role": "system", "content": QUORUM_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ]
+            response = await litellm.acompletion(
+                model=target,
+                messages=messages,
+                temperature=settings.model.temperature,
+                max_tokens=settings.model.max_tokens,
+                **settings.model.extra_params,
+            )
+            return (reviewer_model, response.choices[0].message.content, True, None)
+        except Exception as e:
+            return (reviewer_model, "", False, e)
+
+
+def _parse_verdict(text: str) -> Tuple[Optional[bool], str]:
+    """Extract APPROVE/REJECT from a reviewer's output. Returns (decision_bool_or_None, reason)."""
+    if not text:
+        return (None, "no output")
+    # Find the VERDICT: line (case-insensitive).
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.upper().startswith("VERDICT:"):
+            v = stripped.split(":", 1)[1].strip().upper()
+            if "REJECT" in v:
+                reason = v.replace("REJECT", "").strip(" :-")
+                return (False, reason or "rejected")
+            if "APPROVE" in v or "ACCEPT" in v:
+                reason = v.replace("APPROVE", "").replace("ACCEPT", "").strip(" :-")
+                return (True, reason or "approved")
+    # No explicit verdict line found — treat as None (no decision).
+    return (None, "no explicit verdict")
+
+
+@mcp.tool()
+async def quorum_code_review(
+    code: str,
+    context: str = "",
+    require_unanimous: bool = False,
+    timeout: float = 300.0,
+) -> str:
+    """
+    Run 3 parallel independent code reviews and return a reconciled verdict.
+
+    Each reviewer (a dedicated llama-swap model instance) reasons independently
+    and returns APPROVE or REJECT. Results are reconciled:
+      - All agree    -> strong verdict (consensus)
+      - 2 of 3 agree -> majority verdict with dissent noted
+      - Full split   -> all opinions returned for you to adjudicate
+    Set require_unanimous=True to require all reviewers to APPROVE.
+
+    Args:
+        code: The source code to review.
+        context: Optional surrounding context (what the code is for, constraints).
+        require_unanimous: If True, any REJECT or failure means the overall
+            verdict is REJECT / no consensus.
+        timeout: Per-review timeout in seconds (default 300 — model swaps can be slow).
+    """
+    reviewers = _get_quorum_reviewers()
+    start_time = time.time()
+
+    # Semaphore isn't strictly needed (we want them parallel) but caps at N.
+    # Kept as an extension point in case the pool grows.
+    semaphore = asyncio.Semaphore(len(reviewers))
+
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                *[_single_review(r, code, context, semaphore) for r in reviewers]
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        duration = time.time() - start_time
+        log_mcp_usage("quorum_code_review", "review", duration, status="error",
+                      error=f"timed out after {timeout}s")
+        return f"Quorum review timed out after {timeout}s. Model swaps on the backend can be slow — retry."
+
+    duration = time.time() - start_time
+
+    # Tally verdicts.
+    parsed = []
+    total_prompt = 0
+    total_completion = 0
+    decisions = {"approve": 0, "reject": 0, "no_decision": 0}
+
+    for model_name, text, succeeded, err in results:
+        if not succeeded:
+            parsed.append((model_name, None, f"ERROR: {err}", ""))
+            decisions["no_decision"] += 1
+            continue
+        decision, reason = _parse_verdict(text)
+        parsed.append((model_name, decision, reason, text))
+        if decision is True:
+            decisions["approve"] += 1
+        elif decision is False:
+            decisions["reject"] += 1
+        else:
+            decisions["no_decision"] += 1
+
+    log_mcp_usage("quorum_code_review", "review", duration,
+                  total_prompt, total_completion)
+
+    # Reconcile.
+    n = len(parsed)
+    approves = decisions["approve"]
+    rejects = decisions["reject"]
+    no_decisions = decisions["no_decision"]
+
+    if require_unanimous:
+        if approves == n:
+            overall = "APPROVE (unanimous)"
+        else:
+            overall = "NO CONSENSUS (unanimous required)"
+    elif approves > rejects and approves >= (n / 2):
+        overall = f"APPROVE ({approves}/{n} majority)"
+    elif rejects >= (n / 2):
+        overall = f"REJECT ({rejects}/{n} majority)"
+    else:
+        overall = "SPLIT — no majority, adjudicate manually"
+
+    # Build the report.
+    lines = [
+        f"### Quorum Code Review — {overall}",
+        f"Tally: {approves} approve, {rejects} reject, {no_decisions} no-decision "
+        f"(of {n} reviewers, {duration:.1f}s)",
+        "",
+    ]
+    for model_name, decision, reason, full_text in parsed:
+        verdict_str = {True: "APPROVE", False: "REJECT", None: "NO DECISION"}.get(decision, "NO DECISION")
+        lines.append(f"#### {model_name}: {verdict_str}")
+        if reason and reason != f"ERROR: {reason}":
+            lines.append(f"  Reason: {reason}")
+        if decision is None and full_text:
+            # Include a short excerpt if the reviewer gave no parseable verdict.
+            excerpt = full_text[:300].replace("\n", " ")
+            lines.append(f"  Excerpt: {excerpt}...")
+        lines.append("")
+
+    return "\n".join(lines)
+
 
 @mcp.tool()
 def get_local_llm_usage_stats() -> str:
