@@ -214,8 +214,12 @@ QUORUM_SYSTEM_PROMPT = (
 
 async def _single_review(
     reviewer_model: str, code: str, context: str, semaphore: asyncio.Semaphore
-) -> Tuple[str, str, bool, Optional[Exception]]:
-    """Run one independent review. Returns (model_name, verdict_text, succeeded, error)."""
+) -> Tuple[str, str, str, bool, Optional[Exception]]:
+    """Run one independent review.
+    Returns (model_name, verdict_text, reasoning_text, succeeded, error).
+    reasoning_text captures the thinking model's analysis (reasoning_content)
+    which is where most of the actual review lives for thinking-capable models.
+    """
     async with semaphore:
         try:
             target = resolve_model(reviewer_model)
@@ -231,9 +235,13 @@ async def _single_review(
                 max_tokens=settings.model.max_tokens,
                 **settings.model.extra_params,
             )
-            return (reviewer_model, response.choices[0].message.content, True, None)
+            msg = response.choices[0].message
+            content = getattr(msg, "content", "") or ""
+            # Thinking models (e.g. Gemma-DECKARD) put analysis in reasoning_content.
+            reasoning = getattr(msg, "reasoning_content", "") or getattr(msg, "reasoning", "") or ""
+            return (reviewer_model, content, reasoning, True, None)
         except Exception as e:
-            return (reviewer_model, "", False, e)
+            return (reviewer_model, "", "", False, e)
 
 
 def _parse_verdict(text: str) -> Tuple[Optional[bool], str]:
@@ -307,13 +315,18 @@ async def quorum_code_review(
     total_completion = 0
     decisions = {"approve": 0, "reject": 0, "no_decision": 0}
 
-    for model_name, text, succeeded, err in results:
+    for model_name, text, reasoning, succeeded, err in results:
         if not succeeded:
-            parsed.append((model_name, None, f"ERROR: {err}", ""))
+            parsed.append((model_name, None, f"ERROR: {err}", "", ""))
             decisions["no_decision"] += 1
             continue
-        decision, reason = _parse_verdict(text)
-        parsed.append((model_name, decision, reason, text))
+        # Thinking models may put the verdict in reasoning_content or content.
+        combined = f"{reasoning}\n{text}".strip() if reasoning else text
+        decision, reason = _parse_verdict(combined)
+        if decision is None and text:
+            # Fall back to parsing content alone (some models put verdict there).
+            decision, reason = _parse_verdict(text)
+        parsed.append((model_name, decision, reason, text, reasoning))
         if decision is True:
             decisions["approve"] += 1
         elif decision is False:
@@ -349,15 +362,19 @@ async def quorum_code_review(
         f"(of {n} reviewers, {duration:.1f}s)",
         "",
     ]
-    for model_name, decision, reason, full_text in parsed:
+    for model_name, decision, reason, content_text, reasoning_text in parsed:
         verdict_str = {True: "APPROVE", False: "REJECT", None: "NO DECISION"}.get(decision, "NO DECISION")
         lines.append(f"#### {model_name}: {verdict_str}")
-        if reason and reason != f"ERROR: {reason}":
+        if reason and reason not in ("ERROR: ", "rejected", "approved", ""):
             lines.append(f"  Reason: {reason}")
-        if decision is None and full_text:
-            # Include a short excerpt if the reviewer gave no parseable verdict.
-            excerpt = full_text[:300].replace("\n", " ")
-            lines.append(f"  Excerpt: {excerpt}...")
+        # Include the reviewer's actual analysis. Prefer content (the final answer);
+        # fall back to reasoning_content if content is empty (thinking models).
+        analysis = content_text.strip() if content_text.strip() else reasoning_text.strip()
+        if analysis:
+            lines.append("  Analysis:")
+            for al in analysis.splitlines():
+                if al.strip():
+                    lines.append(f"    {al.rstrip()}")
         lines.append("")
 
     return "\n".join(lines)
