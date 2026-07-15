@@ -61,20 +61,20 @@ def log_mcp_usage(tool_name: str, task_type: str, duration: float, prompt_tokens
 def resolve_model(passed_model: Optional[str] = None) -> str:
     """Resolve the model name, applying auto-prefixing if needed."""
     model_name = passed_model or settings.model.name
-    
-    # Auto-prefix with provider if missing (LiteLLM requirement)
-    if "/" not in model_name:
-        if "11434" in settings.openai_base_url or "ollama" in settings.openai_base_url.lower():
-            # Use openai/ prefix even for Ollama to leverage the /v1 OpenAI-compatible endpoint
-            return f"openai/{model_name}"
-        elif "1234" in settings.openai_base_url: # LM Studio default
-            return f"openai/{model_name}"
-    
+
     # If it was explicitly passed as ollama/, convert it to openai/ to avoid LiteLLM's native ollama provider
     # which has issues with the /v1 path.
     if model_name.startswith("ollama/"):
         return f"openai/{model_name[7:]}"
-        
+
+    # Auto-prefix with openai/ provider if missing (LiteLLM requirement).
+    # Applies to ANY OpenAI-compatible endpoint (Ollama /v1, LM Studio, llama-swap,
+    # vLLM, etc.) — detected via the /v1 path in the base URL or known ports.
+    if "/" not in model_name:
+        base = settings.openai_base_url.lower()
+        if "/v1" in base or "11434" in base or "1234" in base or "ollama" in base:
+            return f"openai/{model_name}"
+
     return model_name
 
 @mcp.tool()
