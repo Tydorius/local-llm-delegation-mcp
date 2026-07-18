@@ -233,6 +233,7 @@ async def _single_review(
                 messages=messages,
                 temperature=settings.model.temperature,
                 max_tokens=settings.model.max_tokens,
+                timeout=600,  # 10 min — thinking models (Gemma-DECKARD ~6.8 t/s, ~1000 tokens) need >60s. Default SDK timeout is 60s and kills these.
                 **settings.model.extra_params,
             )
             msg = response.choices[0].message
@@ -241,6 +242,10 @@ async def _single_review(
             reasoning = getattr(msg, "reasoning_content", "") or getattr(msg, "reasoning", "") or ""
             return (reviewer_model, content, reasoning, True, None)
         except Exception as e:
+            err_str = str(e)
+            # Surface timeout errors explicitly so they're not confused with model failures.
+            if "timed out" in err_str.lower() or "timeout" in err_str.lower():
+                return (reviewer_model, "", "", False, Exception(f"reviewer timed out (60s default SDK limit) — {err_str}"))
             return (reviewer_model, "", "", False, e)
 
 
