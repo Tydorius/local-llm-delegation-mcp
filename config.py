@@ -25,7 +25,11 @@ class Settings(BaseSettings):
     # Paths (Default to absolute paths relative to this file)
     config_path: str = Field(default=os.path.join(os.path.dirname(__file__), "config.yaml"))
     prompts_path: str = Field(default=os.path.join(os.path.dirname(__file__), "prompts.yaml"))
-    usage_log_path: str = Field(default=os.path.join(os.path.dirname(__file__), "mcp_usage.jsonl"))
+    # Usage log lives OUTSIDE site-packages so `uv tool install --force`
+    # reinstalls don't destroy accumulated stats.
+    usage_log_path: str = Field(default=os.path.join(
+        os.path.expanduser("~"), ".local", "share", "local-llm-delegation-mcp",
+        "mcp_usage.jsonl"))
     
     # Internal state (loaded from YAML)
     model: ModelSettings = Field(default_factory=ModelSettings)

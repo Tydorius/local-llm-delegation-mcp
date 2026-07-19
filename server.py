@@ -11,10 +11,11 @@ import json
 import signal
 import threading
 import asyncio
+import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastmcp import FastMCP
+from fastmcp import FastMCP, Context
 import litellm
 from config import settings
 
@@ -52,6 +53,7 @@ def log_mcp_usage(tool_name: str, task_type: str, duration: float, prompt_tokens
         "error": error
     }
     try:
+        os.makedirs(os.path.dirname(settings.usage_log_path), exist_ok=True)
         with open(settings.usage_log_path, "a") as f:
             f.write(json.dumps(entry) + "\n")
     except Exception as e:
@@ -190,6 +192,15 @@ def query_local_llm_with_context(
 # ---------------------------------------------------------------------------
 # Quorum code review: fan out to N parallel independent reviewers, reconcile.
 # Each reviewer (a dedicated llama-swap instance) reasons independently.
+#
+# Two entry points cover different MCP client timeout behaviors:
+#   - quorum_code_review: single call. Emits a progress notification every
+#     QUORUM_HEARTBEAT_SECONDS so clients that reset their request timeout on
+#     progress survive cold model loads (~2-3 min).
+#   - start_quorum_review + get_quorum_result: async job pattern for clients
+#     with a hard per-request timeout (Claude Desktop cancels tool calls at
+#     60s). Each call returns immediately; the review runs in the background
+#     on the server's event loop and is unaffected by client cancellation.
 # ---------------------------------------------------------------------------
 
 # Default reviewer pool — override via env QUORUM_REVIEWERS (comma-separated).
@@ -214,12 +225,16 @@ QUORUM_SYSTEM_PROMPT = (
 
 async def _single_review(
     reviewer_model: str, code: str, context: str, semaphore: asyncio.Semaphore
-) -> Tuple[str, str, str, bool, Optional[Exception]]:
+) -> Dict[str, Any]:
     """Run one independent review.
-    Returns (model_name, verdict_text, reasoning_text, succeeded, error).
-    reasoning_text captures the thinking model's analysis (reasoning_content)
+    Returns a dict with model, content, reasoning, ok, error, and token counts.
+    reasoning captures the thinking model's analysis (reasoning_content)
     which is where most of the actual review lives for thinking-capable models.
     """
+    result: Dict[str, Any] = {
+        "model": reviewer_model, "content": "", "reasoning": "",
+        "ok": False, "error": None, "prompt_tokens": 0, "completion_tokens": 0,
+    }
     async with semaphore:
         try:
             target = resolve_model(reviewer_model)
@@ -233,20 +248,26 @@ async def _single_review(
                 messages=messages,
                 temperature=settings.model.temperature,
                 max_tokens=settings.model.max_tokens,
-                timeout=600,  # 10 min — thinking models (Gemma-DECKARD ~6.8 t/s, ~1000 tokens) need >60s. Default SDK timeout is 60s and kills these.
+                timeout=600,  # 10 min — thinking models (~7 t/s, ~1000 tokens) need >60s; also covers cold llama-swap loads.
                 **settings.model.extra_params,
             )
             msg = response.choices[0].message
-            content = getattr(msg, "content", "") or ""
-            # Thinking models (e.g. Gemma-DECKARD) put analysis in reasoning_content.
-            reasoning = getattr(msg, "reasoning_content", "") or getattr(msg, "reasoning", "") or ""
-            return (reviewer_model, content, reasoning, True, None)
+            result["content"] = getattr(msg, "content", "") or ""
+            # Thinking models put analysis in reasoning_content.
+            result["reasoning"] = getattr(msg, "reasoning_content", "") or getattr(msg, "reasoning", "") or ""
+            usage = getattr(response, "usage", None)
+            if usage:
+                result["prompt_tokens"] = getattr(usage, "prompt_tokens", 0) or 0
+                result["completion_tokens"] = getattr(usage, "completion_tokens", 0) or 0
+            result["ok"] = True
         except Exception as e:
             err_str = str(e)
             # Surface timeout errors explicitly so they're not confused with model failures.
             if "timed out" in err_str.lower() or "timeout" in err_str.lower():
-                return (reviewer_model, "", "", False, Exception(f"reviewer timed out (60s default SDK limit) — {err_str}"))
-            return (reviewer_model, "", "", False, e)
+                result["error"] = f"reviewer timed out — {err_str}"
+            else:
+                result["error"] = err_str
+        return result
 
 
 def _parse_verdict(text: str) -> Tuple[Optional[bool], str]:
@@ -268,70 +289,30 @@ def _parse_verdict(text: str) -> Tuple[Optional[bool], str]:
     return (None, "no explicit verdict")
 
 
-@mcp.tool()
-async def quorum_code_review(
-    code: str,
-    context: str = "",
-    require_unanimous: bool = False,
-    timeout: float = 300.0,
+def _reconcile_reviews(
+    results: List[Dict[str, Any]], duration: float, require_unanimous: bool
 ) -> str:
-    """
-    Run 3 parallel independent code reviews and return a reconciled verdict.
-
-    Each reviewer (a dedicated llama-swap model instance) reasons independently
-    and returns APPROVE or REJECT. Results are reconciled:
-      - All agree    -> strong verdict (consensus)
-      - 2 of 3 agree -> majority verdict with dissent noted
-      - Full split   -> all opinions returned for you to adjudicate
-    Set require_unanimous=True to require all reviewers to APPROVE.
-
-    Args:
-        code: The source code to review.
-        context: Optional surrounding context (what the code is for, constraints).
-        require_unanimous: If True, any REJECT or failure means the overall
-            verdict is REJECT / no consensus.
-        timeout: Per-review timeout in seconds (default 300 — model swaps can be slow).
-    """
-    reviewers = _get_quorum_reviewers()
-    start_time = time.time()
-
-    # Semaphore isn't strictly needed (we want them parallel) but caps at N.
-    # Kept as an extension point in case the pool grows.
-    semaphore = asyncio.Semaphore(len(reviewers))
-
-    try:
-        results = await asyncio.wait_for(
-            asyncio.gather(
-                *[_single_review(r, code, context, semaphore) for r in reviewers]
-            ),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        duration = time.time() - start_time
-        log_mcp_usage("quorum_code_review", "review", duration, status="error",
-                      error=f"timed out after {timeout}s")
-        return f"Quorum review timed out after {timeout}s. Model swaps on the backend can be slow — retry."
-
-    duration = time.time() - start_time
-
-    # Tally verdicts.
+    """Tally reviewer verdicts, log usage (with real token totals), build the report."""
     parsed = []
     total_prompt = 0
     total_completion = 0
     decisions = {"approve": 0, "reject": 0, "no_decision": 0}
 
-    for model_name, text, reasoning, succeeded, err in results:
-        if not succeeded:
-            parsed.append((model_name, None, f"ERROR: {err}", "", ""))
+    for r in results:
+        total_prompt += r["prompt_tokens"]
+        total_completion += r["completion_tokens"]
+        if not r["ok"]:
+            parsed.append((r["model"], None, f"ERROR: {r['error']}", "", ""))
             decisions["no_decision"] += 1
             continue
+        text, reasoning = r["content"], r["reasoning"]
         # Thinking models may put the verdict in reasoning_content or content.
         combined = f"{reasoning}\n{text}".strip() if reasoning else text
         decision, reason = _parse_verdict(combined)
         if decision is None and text:
             # Fall back to parsing content alone (some models put verdict there).
             decision, reason = _parse_verdict(text)
-        parsed.append((model_name, decision, reason, text, reasoning))
+        parsed.append((r["model"], decision, reason, text, reasoning))
         if decision is True:
             decisions["approve"] += 1
         elif decision is False:
@@ -383,6 +364,175 @@ async def quorum_code_review(
         lines.append("")
 
     return "\n".join(lines)
+
+
+QUORUM_HEARTBEAT_SECONDS = 10.0
+
+
+async def _run_quorum(
+    code: str,
+    context: str,
+    require_unanimous: bool,
+    timeout: float,
+    ctx: Optional[Context] = None,
+) -> str:
+    """Fan out to all reviewers, reconcile, and return the report.
+
+    Heartbeats progress via ctx (if provided) so MCP clients that reset their
+    request timeout on progress notifications don't cancel the call during cold
+    model loads. If the client cancels anyway, log it before propagating —
+    silent CancelledError is indistinguishable from a hang in the usage log.
+    """
+    reviewers = _get_quorum_reviewers()
+    start_time = time.time()
+
+    # Semaphore isn't strictly needed (we want them parallel) but caps at N.
+    # Kept as an extension point in case the pool grows.
+    semaphore = asyncio.Semaphore(len(reviewers))
+    gather = asyncio.gather(
+        *[_single_review(r, code, context, semaphore) for r in reviewers]
+    )
+
+    try:
+        while True:
+            elapsed = time.time() - start_time
+            remaining = timeout - elapsed
+            if remaining <= 0:
+                gather.cancel()
+                log_mcp_usage("quorum_code_review", "review", elapsed, status="error",
+                              error=f"timed out after {timeout}s")
+                return (f"Quorum review timed out after {timeout}s. Model swaps on the "
+                        f"backend can be slow — retry, or raise the timeout parameter.")
+            try:
+                # shield: a heartbeat interval elapsing must not cancel the reviews.
+                results = await asyncio.wait_for(
+                    asyncio.shield(gather),
+                    timeout=min(QUORUM_HEARTBEAT_SECONDS, remaining),
+                )
+                break
+            except asyncio.TimeoutError:
+                if ctx is not None:
+                    try:
+                        await ctx.report_progress(progress=elapsed, total=timeout)
+                    except Exception:
+                        pass  # progress is best-effort; never fail the review over it
+    except asyncio.CancelledError:
+        gather.cancel()
+        log_mcp_usage("quorum_code_review", "review", time.time() - start_time,
+                      status="error",
+                      error="cancelled by MCP client — likely the client's own request "
+                            "timeout (Claude Desktop: 60s); use start_quorum_review instead")
+        raise
+
+    return _reconcile_reviews(results, time.time() - start_time, require_unanimous)
+
+
+@mcp.tool()
+async def quorum_code_review(
+    code: str,
+    context: str = "",
+    require_unanimous: bool = False,
+    timeout: float = 300.0,
+    ctx: Optional[Context] = None,
+) -> str:
+    """
+    Run 3 parallel independent code reviews and return a reconciled verdict.
+
+    NOTE: cold model loads take 2-3 minutes. If your MCP client enforces a hard
+    per-request timeout (Claude Desktop cancels at ~60s), use start_quorum_review
+    + get_quorum_result instead — this call emits progress heartbeats, but not
+    all clients honor them.
+
+    Each reviewer (a dedicated llama-swap model instance) reasons independently
+    and returns APPROVE or REJECT. Results are reconciled:
+      - All agree    -> strong verdict (consensus)
+      - 2 of 3 agree -> majority verdict with dissent noted
+      - Full split   -> all opinions returned for you to adjudicate
+    Set require_unanimous=True to require all reviewers to APPROVE.
+
+    Args:
+        code: The source code to review.
+        context: Optional surrounding context (what the code is for, constraints).
+        require_unanimous: If True, any REJECT or failure means the overall
+            verdict is REJECT / no consensus.
+        timeout: Per-review timeout in seconds (default 300 — model swaps can be slow).
+    """
+    return await _run_quorum(code, context, require_unanimous, timeout, ctx)
+
+
+# Background quorum jobs, keyed by job id. Kept in-process: jobs die with the
+# server, which is acceptable — the client that started a job polls it within
+# the same session.
+_quorum_jobs: Dict[str, Dict[str, Any]] = {}
+_QUORUM_JOB_TTL_SECONDS = 3600.0
+
+
+def _prune_quorum_jobs() -> None:
+    now = time.time()
+    stale = [jid for jid, rec in _quorum_jobs.items()
+             if rec["done"] and now - rec["finished"] > _QUORUM_JOB_TTL_SECONDS]
+    for jid in stale:
+        del _quorum_jobs[jid]
+
+
+@mcp.tool()
+async def start_quorum_review(
+    code: str,
+    context: str = "",
+    require_unanimous: bool = False,
+    timeout: float = 300.0,
+) -> str:
+    """
+    Start a quorum code review as a background job and return immediately.
+
+    Use this (with get_quorum_result) instead of quorum_code_review when your
+    MCP client enforces a hard per-request timeout: the review keeps running
+    server-side no matter what the client does. Same semantics as
+    quorum_code_review otherwise — see its docstring for args and verdicts.
+
+    Returns a job id. Poll get_quorum_result(job_id) after ~60s (warm models)
+    or 2-3 minutes (cold load).
+    """
+    _prune_quorum_jobs()
+    job_id = uuid.uuid4().hex[:12]
+    rec: Dict[str, Any] = {"done": False, "started": time.time(),
+                           "finished": None, "result": None, "task": None}
+
+    async def _runner():
+        try:
+            rec["result"] = await _run_quorum(code, context, require_unanimous, timeout)
+        except Exception as e:
+            rec["result"] = f"Quorum job {job_id} failed: {e}"
+        finally:
+            rec["done"] = True
+            rec["finished"] = time.time()
+
+    rec["task"] = asyncio.create_task(_runner())
+    _quorum_jobs[job_id] = rec
+    n = len(_get_quorum_reviewers())
+    return (f"Quorum review started: job_id={job_id} ({n} reviewers, timeout {timeout:.0f}s). "
+            f"Poll get_quorum_result(job_id=\"{job_id}\") in ~60s (warm) or 2-3 min (cold load). "
+            f"The job runs server-side and survives client-side call timeouts.")
+
+
+@mcp.tool()
+async def get_quorum_result(job_id: str) -> str:
+    """
+    Fetch the result of a quorum review started with start_quorum_review.
+
+    Returns the full reconciled review report if the job is done, or a status
+    line with elapsed time if it is still running (poll again in ~30s).
+    Results are kept for 1 hour after completion.
+    """
+    rec = _quorum_jobs.get(job_id)
+    if rec is None:
+        return (f"Unknown job_id '{job_id}'. Either it expired (results are kept 1 hour), "
+                f"the server restarted, or the id is wrong.")
+    if not rec["done"]:
+        elapsed = time.time() - rec["started"]
+        return (f"Job {job_id} still running ({elapsed:.0f}s elapsed). Poll again in ~30s. "
+                f"Cold model loads can take 2-3 minutes.")
+    return rec["result"]
 
 
 @mcp.tool()

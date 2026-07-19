@@ -1,13 +1,11 @@
-# Local LLM Configuration (Optimized for Qwen3-Coder-Flash on M5 Max)
-# Override these values to match what is appropriate on your machine
+# Local LLM Configuration for delegation
+# Canonical copy — the active file lives in the uv tool's site-packages.
+# If you `uv tool upgrade`, re-copy this to site-packages/config.yaml.
+# Endpoint + model name are set via env (OPENAI_BASE_URL, LOCAL_MODEL_NAME)
+# in the ZCode MCP config, which take precedence over this file.
 model:
-  name: "openai/Qwen3-Coder-30B-A3B-Instruct-MLX-8bit" # Local OMLX model
-  temperature: 0.1
+  name: "delegation-worker-1"   # default worker; overridable per-call via the `model` param
+  temperature: 0.1              # low for deterministic code output
   max_tokens: 32768
-  # Extra parameters passed to LiteLLM/Provider
   extra_params:
-    num_ctx: 65536 # Doubled context for better repo understanding
-    num_predict: 32768 # Matches max_tokens
-    top_p: 0.80 # Tightened for better code correctness
-    top_k: 20 # Standard for Qwen3 Coder
-    repeat_penalty: 1.05
+    top_p: 0.80

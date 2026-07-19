@@ -112,9 +112,26 @@ Add to your `~/.claude.json`:
 ```
 *Note: If using a custom startup script (like for OMLX), set the `command` to the absolute path of your script.*
 
+## 🧑‍⚖️ Quorum Code Review
+
+Three reviewer models (llama-swap instances `delegation-reviewer-1/2/3` by default;
+override via `QUORUM_REVIEWERS`) review code in parallel and the verdicts are
+reconciled into a consensus/majority/split report.
+
+- `quorum_code_review(code, context, require_unanimous, timeout)` — single call.
+  Emits MCP progress notifications every 10s so clients that reset their request
+  timeout on progress survive cold model loads (2-3 min).
+- `start_quorum_review(...)` → job id, returns immediately;
+  `get_quorum_result(job_id)` — poll for the report. Use this pair when the MCP
+  client enforces a hard per-request timeout (**Claude Desktop cancels tool calls
+  at ~60s** — the server-side timeout cannot fix that). The review runs in the
+  background on the server and survives client-side cancellation; results are
+  kept for 1 hour.
+
 ## 📊 Usage Tracking
 
-The server logs usage to `mcp_usage.jsonl`. View stats via:
+The server logs usage to `~/.local/share/local-llm-delegation-mcp/mcp_usage.jsonl`
+(outside the install directory, so reinstalls/upgrades keep your stats). View stats via:
 - `get_local_llm_usage_stats` (MCP tool)
 - `show-stats` (CLI command - coming soon) or `python show_stats.py`
 
